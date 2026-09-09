@@ -18,11 +18,12 @@ from aws_lambda_builders.workflows.python_pip.packager import SubprocessPip
 from aws_lambda_builders.workflows.python_pip.packager import get_lambda_abi
 from aws_lambda_builders.workflows.python_pip.packager import InvalidSourceDistributionNameError
 from aws_lambda_builders.workflows.python_pip.packager import NoSuchPackageError
+from aws_lambda_builders.workflows.python_pip.packager import UnsupportedPackageError
+from aws_lambda_builders.workflows.python_pip.packager import UnsupportedPythonVersion
+from aws_lambda_builders.workflows.python_pip.packager import _parse_pyproject_name_version
 from aws_lambda_builders.workflows.python_pip.packager import PackageDownloadError
 from aws_lambda_builders.workflows.python_pip.packager import RequirementsFileNotFoundError
 from aws_lambda_builders.workflows.python_pip.packager import MissingDependencyError
-from aws_lambda_builders.workflows.python_pip.packager import UnsupportedPackageError
-from aws_lambda_builders.workflows.python_pip.packager import UnsupportedPythonVersion
 
 from aws_lambda_builders.workflows.python_pip import packager
 
@@ -518,6 +519,91 @@ class TestSDistMetadataFetcher(TestCase):
 
         self.assertEqual(name, not_default_name)
         self.assertEqual(version, not_default_version)
+
+    @patch("aws_lambda_builders.workflows.python_pip.packager.SDistMetadataFetcher._unpack_sdist_into_dir")
+    @patch("aws_lambda_builders.workflows.python_pip.packager.SDistMetadataFetcher._get_pkg_info_filepath")
+    @patch("aws_lambda_builders.workflows.python_pip.packager.SDistMetadataFetcher._get_name_version_from_pyproject")
+    @patch("aws_lambda_builders.workflows.python_pip.utils.OSUtils.tempdir")
+    def test_get_package_name_version_pyproject_fallback(
+        self, tempdir_mock, get_pyproject_mock, get_pkg_mock, unpack_mock
+    ):
+        """
+        Tests that a PEP 517-only sdist (no setup.py/PKG-INFO, e.g. downloaded
+        from a git+https requirement) falls back to pyproject.toml metadata
+        instead of raising UnsupportedPackageError (#675).
+        """
+        get_pkg_mock.side_effect = UnsupportedPackageError("pkgdir")
+        get_pyproject_mock.return_value = ("pyproject-pkg", "2.0.0")
+
+        sdist = SDistMetadataFetcher(OSUtils)
+        name, version = sdist.get_package_name_and_version(mock.Mock())
+
+        self.assertEqual(name, "pyproject-pkg")
+        self.assertEqual(version, "2.0.0")
+
+    @patch("aws_lambda_builders.workflows.python_pip.packager.SDistMetadataFetcher._unpack_sdist_into_dir")
+    @patch("aws_lambda_builders.workflows.python_pip.packager.SDistMetadataFetcher._get_pkg_info_filepath")
+    @patch("aws_lambda_builders.workflows.python_pip.packager.SDistMetadataFetcher._get_name_version_from_pyproject")
+    @patch("aws_lambda_builders.workflows.python_pip.utils.OSUtils.tempdir")
+    def test_get_package_name_version_pyproject_fallback_still_raises(
+        self, tempdir_mock, get_pyproject_mock, get_pkg_mock, unpack_mock
+    ):
+        """
+        Tests that UnsupportedPackageError is still raised when neither
+        PKG-INFO nor pyproject.toml metadata is available.
+        """
+        get_pkg_mock.side_effect = UnsupportedPackageError("pkgdir")
+        get_pyproject_mock.side_effect = UnsupportedPackageError("pkgdir")
+
+        sdist = SDistMetadataFetcher(OSUtils)
+        with self.assertRaises(UnsupportedPackageError):
+            sdist.get_package_name_and_version(mock.Mock())
+
+    def test_get_name_version_from_pyproject(self):
+        import os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as package_dir:
+            with open(os.path.join(package_dir, "pyproject.toml"), "w") as f:
+                f.write('[project]\nname = "my-pkg"\nversion = "1.2.3"\n')
+
+            sdist = SDistMetadataFetcher(OSUtils)
+            self.assertEqual(sdist._get_name_version_from_pyproject(package_dir), ("my-pkg", "1.2.3"))
+
+    def test_get_name_version_from_pyproject_missing_file(self):
+        sdist = SDistMetadataFetcher(OSUtils)
+        with self.assertRaises(UnsupportedPackageError):
+            sdist._get_name_version_from_pyproject("/nonexistent-dir")
+
+    def test_get_name_version_from_pyproject_dynamic_version(self):
+        import os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as package_dir:
+            with open(os.path.join(package_dir, "pyproject.toml"), "w") as f:
+                f.write('[project]\nname = "my-pkg"\ndynamic = ["version"]\n')
+
+            sdist = SDistMetadataFetcher(OSUtils)
+            with self.assertRaises(UnsupportedPackageError):
+                sdist._get_name_version_from_pyproject(package_dir)
+
+    @parameterized.expand(
+        [
+            ('[project]\nname = "foo"\nversion = "1.2.3"\n', ("foo", "1.2.3")),
+            ("[build-system]\nrequires = []\n", (None, None)),
+            ('[project]\nname = "foo"\ndynamic = ["version"]\n', (None, None)),
+            ('[project]\nname = "foo"\nversion = "1.0"\n[tool.x]\nname = "nope"\nversion = "9"\n', ("foo", "1.0")),
+        ]
+    )
+    def test_parse_pyproject_name_version(self, contents, expected):
+        self.assertEqual(_parse_pyproject_name_version(contents), expected)
+
+    def test_parse_pyproject_name_version_without_tomllib(self):
+        # Python 3.10 has no stdlib tomllib; the line-based parse must work.
+        with patch("aws_lambda_builders.workflows.python_pip.packager.tomllib", None):
+            self.assertEqual(
+                _parse_pyproject_name_version('[project]\nname = "foo"\nversion = "1.2.3"\n'), ("foo", "1.2.3")
+            )
 
 
 class TestDependencyBuilder(object):

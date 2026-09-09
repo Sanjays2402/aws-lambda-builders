@@ -7,7 +7,12 @@ import logging
 import re
 import subprocess
 from email.parser import FeedParser
-from typing import List, Tuple
+from typing import List, Optional, Tuple
+
+try:
+    import tomllib
+except ImportError:  # Python 3.10 does not have tomllib in the standard library
+    tomllib = None
 
 from aws_lambda_builders.architecture import ARM64, X86_64
 from aws_lambda_builders.utils import extract_tarfile
@@ -29,6 +34,45 @@ the vendor folder.
 
 class PackagerError(Exception):
     pass
+
+
+def _parse_pyproject_name_version(contents: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Reads the PEP 621 ``[project]`` name and version from pyproject.toml contents.
+
+    Returns (None, None) when no usable static name/version can be determined
+    (missing table, dynamic version, or unparsable file). Uses stdlib
+    ``tomllib`` when available (Python 3.11+) and a minimal line-based parse
+    of the ``[project]`` section otherwise, so this keeps working on
+    Python 3.10.
+    """
+    name, version = None, None
+    if tomllib is not None:
+        try:
+            project = tomllib.loads(contents).get("project") or {}
+            candidate_name, candidate_version = project.get("name"), project.get("version")
+            if isinstance(candidate_name, str) and isinstance(candidate_version, str):
+                return candidate_name, candidate_version
+        except Exception:
+            # Invalid TOML; fall through to the line-based parse below.
+            pass
+    in_project_section = False
+    for line in contents.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("["):
+            in_project_section = stripped == "[project]"
+            continue
+        if not in_project_section or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, _, value = stripped.partition("=")
+        value = value.strip().strip("\"'")
+        if key.strip() == "name" and not name:
+            name = value or None
+        elif key.strip() == "version" and not version:
+            version = value or None
+    if not name or not version:
+        return None, None
+    return name, version
 
 
 class InvalidSourceDistributionNameError(PackagerError):
@@ -755,6 +799,40 @@ class SDistMetadataFetcher(object):
 
         return pkg_info_path
 
+    def _get_name_version_from_pyproject(self, package_dir: str) -> Tuple[str, str]:
+        """
+        Extracts the name and version from the PEP 621 [project] table of a
+        pyproject.toml file.
+
+        This is a last resort for sdists that carry no setup.py or PKG-INFO
+        metadata (e.g. PEP 517-only projects downloaded from git+https URLs),
+        where `setup.py egg_info` cannot produce any metadata.
+
+        Parameters
+        ----------
+        package_dir: str
+            The path of the unpacked sdist directory
+
+        Returns
+        -------
+        Tuple[str, str]
+            A tuple containing the name and version
+
+        Raises
+        ------
+        UnsupportedPackageError
+            If no usable static name/version can be read from pyproject.toml
+        """
+        pyproject_path = self._osutils.joinpath(package_dir, "pyproject.toml")
+        if not self._osutils.file_exists(pyproject_path):
+            raise UnsupportedPackageError(self._osutils.basename(package_dir))
+        contents = self._osutils.get_file_contents(pyproject_path, binary=False)
+        name, version = _parse_pyproject_name_version(contents)
+        if not name or not version:
+            raise UnsupportedPackageError(self._osutils.basename(package_dir))
+        LOG.debug("Using name/version from pyproject.toml [project] table: %s==%s", name, version)
+        return name, version
+
     def _unpack_sdist_into_dir(self, sdist_path, unpack_dir):
         if sdist_path.endswith(".zip"):
             self._osutils.extract_zipfile(sdist_path, unpack_dir)
@@ -820,9 +898,17 @@ class SDistMetadataFetcher(object):
         with self._osutils.tempdir() as tempdir:
             package_dir = self._unpack_sdist_into_dir(sdist_path, tempdir)
 
-            # get the name and version from the result setup.py
-            pkg_info_filepath = self._get_pkg_info_filepath(package_dir)
-            name, version = self._get_name_version(pkg_info_filepath)
+            try:
+                # get the name and version from the result setup.py
+                pkg_info_filepath = self._get_pkg_info_filepath(package_dir)
+                name, version = self._get_name_version(pkg_info_filepath)
+            except UnsupportedPackageError:
+                # PEP 517-only sdists (e.g. downloaded from a git+https
+                # requirement) may carry no setup.py or PKG-INFO metadata for
+                # `setup.py egg_info` to read, which fails outright in Python
+                # 3.12+ build environments where setuptools is not installed.
+                # Fall back to the PEP 621 [project] metadata in pyproject.toml.
+                name, version = self._get_name_version_from_pyproject(package_dir)
 
             # return values if it is not the default values
             if not self._is_default_setuptools_values(name, version):
