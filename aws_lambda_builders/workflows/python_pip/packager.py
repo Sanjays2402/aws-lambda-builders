@@ -848,18 +848,39 @@ class SDistMetadataFetcher(object):
         """
         pyproject_path = self._osutils.joinpath(package_dir, "pyproject.toml")
         if not self._osutils.file_exists(pyproject_path):
+            self._warn_unrecoverable_metadata(package_dir)
             raise UnsupportedPackageError(self._osutils.basename(package_dir))
         try:
             # utf-8-sig also tolerates a BOM so BOM-prefixed files still parse.
             contents = self._osutils.get_file_contents(pyproject_path, binary=False, encoding="utf-8-sig")
         except (OSError, UnicodeDecodeError) as ex:
             LOG.debug("Unable to read %s: %s", pyproject_path, ex)
+            self._warn_unrecoverable_metadata(package_dir)
             raise UnsupportedPackageError(self._osutils.basename(package_dir)) from ex
         name, version = _parse_pyproject_name_version(contents)
         if not name or not version:
+            self._warn_unrecoverable_metadata(package_dir)
             raise UnsupportedPackageError(self._osutils.basename(package_dir))
         LOG.debug("Using name/version from pyproject.toml [project] table: %s==%s", name, version)
         return name, version
+
+    @staticmethod
+    def _warn_unrecoverable_metadata(package_dir: str) -> None:
+        """
+        Emits the user-visible diagnostic when no metadata source remains.
+
+        The PKG-INFO probe now logs at debug because the pyproject.toml
+        fallback may recover; this warning is emitted only at the point where
+        recovery definitively fails so `sam build` output still names the
+        likely cause instead of just the opaque UnsupportedPackageError.
+        """
+        LOG.warning(
+            "Unable to determine a static name/version for the package in %s. "
+            "No PKG-INFO metadata was available (this may be due to missing "
+            "setuptools/distutils in Python 3.12+) and pyproject.toml has no "
+            "static [project] name/version.",
+            package_dir,
+        )
 
     def _unpack_sdist_into_dir(self, sdist_path, unpack_dir):
         if sdist_path.endswith(".zip"):

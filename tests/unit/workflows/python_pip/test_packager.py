@@ -675,6 +675,51 @@ class TestSDistMetadataFetcher(TestCase):
             sdist = SDistMetadataFetcher(sys.executable, OSUtils())
             self.assertEqual(sdist._get_name_version_from_pyproject(package_dir), ("my-pkg", "1.2.3"))
 
+    def test_get_name_version_from_pyproject_terminal_failure_logs_warning(self):
+        # Terminal failure (no pyproject.toml at all) must emit a
+        # user-visible WARNING naming the cause, not just the opaque
+        # UnsupportedPackageError.
+        sdist = SDistMetadataFetcher(OSUtils)
+        with self.assertLogs("aws_lambda_builders.workflows.python_pip.packager", level="WARNING") as logs:
+            with self.assertRaises(UnsupportedPackageError):
+                sdist._get_name_version_from_pyproject("/nonexistent-dir")
+        self.assertTrue(
+            any("Unable to determine a static name/version" in msg for msg in logs.output),
+            "expected the diagnostic warning on terminal failure",
+        )
+
+    def test_get_name_version_from_pyproject_no_metadata_logs_warning(self):
+        # pyproject.toml exists but has no static [project] name/version
+        # (e.g. dynamic = ["version"]) -> warning on the terminal failure.
+        import os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as package_dir:
+            with open(os.path.join(package_dir, "pyproject.toml"), "w") as f:
+                f.write('[project]\nname = "my-pkg"\ndynamic = ["version"]\n')
+
+            sdist = SDistMetadataFetcher(OSUtils)
+            with self.assertLogs("aws_lambda_builders.workflows.python_pip.packager", level="WARNING") as logs:
+                with self.assertRaises(UnsupportedPackageError):
+                    sdist._get_name_version_from_pyproject(package_dir)
+        self.assertTrue(
+            any("Unable to determine a static name/version" in msg for msg in logs.output),
+            "expected the diagnostic warning on terminal failure",
+        )
+
+    def test_get_name_version_from_pyproject_success_no_warning(self):
+        # A successful recovery must stay clean: no WARNING on the success path.
+        import os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as package_dir:
+            with open(os.path.join(package_dir, "pyproject.toml"), "w") as f:
+                f.write('[project]\nname = "my-pkg"\nversion = "1.2.3"\n')
+
+            sdist = SDistMetadataFetcher(OSUtils)
+            with self.assertNoLogs("aws_lambda_builders.workflows.python_pip.packager", level="WARNING"):
+                self.assertEqual(sdist._get_name_version_from_pyproject(package_dir), ("my-pkg", "1.2.3"))
+
     def test_get_pkg_info_filepath_no_warning_when_missing(self):
         # The PKG-INFO probe is a recoverable step (pyproject.toml fallback),
         # so a missing PKG-INFO must not emit a misleading WARNING.
