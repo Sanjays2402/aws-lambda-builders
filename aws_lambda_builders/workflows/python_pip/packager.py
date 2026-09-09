@@ -55,9 +55,15 @@ def _parse_pyproject_name_version(contents: str) -> Tuple[Optional[str], Optiona
     """
     if tomllib is not None:
         try:
-            project = tomllib.loads(contents).get("project") or {}
+            parsed = tomllib.loads(contents)
         except tomllib.TOMLDecodeError as ex:
             LOG.debug("Unable to parse pyproject.toml with tomllib: %s", ex)
+            return None, None
+        project = parsed.get("project")
+        if not isinstance(project, dict):
+            # `project = "something"` is valid TOML but not a table; do not
+            # assume shape on third-party input.
+            LOG.debug("pyproject.toml [project] is not a table; cannot read name/version")
             return None, None
         candidate_name, candidate_version = project.get("name"), project.get("version")
         if isinstance(candidate_name, str) and isinstance(candidate_version, str):
@@ -784,7 +790,11 @@ class SDistMetadataFetcher(object):
                 LOG.debug("Error while searching for existing .egg-info directories: %s", e)
 
             if not self._osutils.file_exists(pkg_info_path):
-                LOG.warning(
+                # This used to be a warning, but the caller may now recover via
+                # pyproject.toml metadata, in which case the build succeeds and
+                # a warning would be misleading. Keep it at debug; the caller
+                # logs an explicit message when recovery succeeds.
+                LOG.debug(
                     "Unable to find PKG-INFO file for package in %s. "
                     "This may be due to missing setuptools/distutils in Python 3.12+ "
                     "or an incomplete sdist package.",
@@ -839,7 +849,12 @@ class SDistMetadataFetcher(object):
         pyproject_path = self._osutils.joinpath(package_dir, "pyproject.toml")
         if not self._osutils.file_exists(pyproject_path):
             raise UnsupportedPackageError(self._osutils.basename(package_dir))
-        contents = self._osutils.get_file_contents(pyproject_path, binary=False)
+        try:
+            # utf-8-sig also tolerates a BOM so BOM-prefixed files still parse.
+            contents = self._osutils.get_file_contents(pyproject_path, binary=False, encoding="utf-8-sig")
+        except (OSError, UnicodeDecodeError) as ex:
+            LOG.debug("Unable to read %s: %s", pyproject_path, ex)
+            raise UnsupportedPackageError(self._osutils.basename(package_dir)) from ex
         name, version = _parse_pyproject_name_version(contents)
         if not name or not version:
             raise UnsupportedPackageError(self._osutils.basename(package_dir))
@@ -922,6 +937,11 @@ class SDistMetadataFetcher(object):
                 # 3.12+ build environments where setuptools is not installed.
                 # Fall back to the PEP 621 [project] metadata in pyproject.toml.
                 name, version = self._get_name_version_from_pyproject(package_dir)
+                LOG.info(
+                    "Recovered name/version for package in %s from pyproject.toml "
+                    "[project] table; PKG-INFO metadata was unavailable.",
+                    package_dir,
+                )
 
             # return values if it is not the default values
             if not self._is_default_setuptools_values(name, version):
