@@ -23,6 +23,12 @@ from .utils import OSUtils
 LOG = logging.getLogger(__name__)
 
 
+# Matches a quoted scalar value with an optional trailing comment, e.g.
+#   "1.2.3"            -> group(2) == 1.2.3
+#   'foo'  # comment   -> group(2) == foo
+QUOTED_VALUE = re.compile(r"""^(["'])(.*?)\1\s*(?:#.*)?$""")
+
+
 # TODO update the wording here
 MISSING_DEPENDENCIES_TEMPLATE = r"""
 Could not install dependencies:
@@ -44,28 +50,35 @@ def _parse_pyproject_name_version(contents: str) -> Tuple[Optional[str], Optiona
     (missing table, dynamic version, or unparsable file). Uses stdlib
     ``tomllib`` when available (Python 3.11+) and a minimal line-based parse
     of the ``[project]`` section otherwise, so this keeps working on
-    Python 3.10.
+    Python 3.10. The line-based parse only accepts properly quoted scalars and
+    tolerates trailing comments.
     """
-    name, version = None, None
     if tomllib is not None:
         try:
             project = tomllib.loads(contents).get("project") or {}
-            candidate_name, candidate_version = project.get("name"), project.get("version")
-            if isinstance(candidate_name, str) and isinstance(candidate_version, str):
-                return candidate_name, candidate_version
-        except Exception:
-            # Invalid TOML; fall through to the line-based parse below.
-            pass
+        except tomllib.TOMLDecodeError as ex:
+            LOG.debug("Unable to parse pyproject.toml with tomllib: %s", ex)
+            return None, None
+        candidate_name, candidate_version = project.get("name"), project.get("version")
+        if isinstance(candidate_name, str) and isinstance(candidate_version, str):
+            return candidate_name, candidate_version
+        return None, None
+    name, version = None, None
     in_project_section = False
     for line in contents.splitlines():
         stripped = line.strip()
         if stripped.startswith("["):
-            in_project_section = stripped == "[project]"
+            # tolerate trailing comments on the header, e.g. "[project]  # main"
+            in_project_section = stripped.split("#")[0].strip() == "[project]"
             continue
         if not in_project_section or stripped.startswith("#") or "=" not in stripped:
             continue
         key, _, value = stripped.partition("=")
-        value = value.strip().strip("\"'")
+        match = QUOTED_VALUE.match(value.strip())
+        if not match:
+            # Skip anything that is not a quoted scalar (e.g. dynamic = ["version"])
+            continue
+        value = match.group(2)
         if key.strip() == "name" and not name:
             name = value or None
         elif key.strip() == "version" and not version:

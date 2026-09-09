@@ -593,17 +593,50 @@ class TestSDistMetadataFetcher(TestCase):
             ("[build-system]\nrequires = []\n", (None, None)),
             ('[project]\nname = "foo"\ndynamic = ["version"]\n', (None, None)),
             ('[project]\nname = "foo"\nversion = "1.0"\n[tool.x]\nname = "nope"\nversion = "9"\n', ("foo", "1.0")),
+            # trailing comments (e.g. release-please version markers) must be stripped
+            ('[project]\nname = "foo"\nversion = "1.2.3"  # x-release-please-version\n', ("foo", "1.2.3")),
+            ("[project]  # main table\nname = 'foo'\nversion = '1.0'\n", ("foo", "1.0")),
+            # non-scalar values must not be picked up as name/version
+            ('[project]\nname = "foo"\ndynamic = ["version"]\n', (None, None)),
+            ('[project]\nname = ["foo"]\nversion = "1.0"\n', (None, None)),
         ]
     )
     def test_parse_pyproject_name_version(self, contents, expected):
         self.assertEqual(_parse_pyproject_name_version(contents), expected)
 
     def test_parse_pyproject_name_version_without_tomllib(self):
-        # Python 3.10 has no stdlib tomllib; the line-based parse must work.
+        # Python 3.10 has no stdlib tomllib; the line-based parse must work,
+        # including inline comments that tools like release-please add.
         with patch("aws_lambda_builders.workflows.python_pip.packager.tomllib", None):
             self.assertEqual(
                 _parse_pyproject_name_version('[project]\nname = "foo"\nversion = "1.2.3"\n'), ("foo", "1.2.3")
             )
+            self.assertEqual(
+                _parse_pyproject_name_version(
+                    '[project]  # header comment\nname = "foo"  # n\nversion = "1.2.3"  # x-release-please-version\n'
+                ),
+                ("foo", "1.2.3"),
+            )
+            self.assertEqual(
+                _parse_pyproject_name_version('[project]\nname = "foo"\ndynamic = ["version"]\n'), (None, None)
+            )
+            # unparsable TOML is best-effort on the line-based path (it is the
+            # only parser available on 3.10); quoted scalars still extract.
+            self.assertEqual(
+                _parse_pyproject_name_version('[project]\nname = "foo"\nversion = "1.2.3"\nunclosed = ["x"\n'),
+                ("foo", "1.2.3"),
+            )
+
+    def test_parse_pyproject_name_version_malformed_toml_returns_none(self):
+        # On 3.11+, a real TOML parser is available: a malformed file must
+        # yield (None, None) rather than best-effort values from the fallback.
+        from aws_lambda_builders.workflows.python_pip.packager import tomllib as _tomllib
+
+        if _tomllib is None:
+            self.skipTest("requires stdlib tomllib (Python 3.11+)")
+        self.assertEqual(
+            _parse_pyproject_name_version('[project]\nname = "foo"\nversion = "1.2.3"\nunclosed = ["x"\n'), (None, None)
+        )
 
 
 class TestDependencyBuilder(object):
