@@ -17,8 +17,6 @@ except ImportError:  # Python 3.10 does not have tomllib in the standard library
 from aws_lambda_builders.architecture import ARM64, X86_64
 from aws_lambda_builders.utils import extract_tarfile
 
-from packaging.version import InvalidVersion, Version
-
 from .compat import pip_import_string, pip_no_compile_c_env_vars, pip_no_compile_c_shim
 from .utils import OSUtils
 
@@ -41,7 +39,17 @@ def _canonicalize_version(version):
     never reconcile with the wheel built from it. Returns None when the
     version is not valid PEP 440, in which case the package is treated as
     unrecoverable.
+
+    The ``packaging`` import is local and degradable: this is a rare fallback
+    path, and importing it at module scope would make it a hard import-time
+    requirement for the entire python_pip workflow (PLC0415 is already in the
+    ruff ignore list, so a function-local import is idiomatic here).
     """
+    try:
+        from packaging.version import InvalidVersion, Version
+    except ImportError:
+        LOG.debug("packaging is unavailable; using the pyproject.toml version as written")
+        return version
     try:
         return str(Version(version))
     except InvalidVersion:
@@ -60,6 +68,21 @@ the vendor folder.
 
 class PackagerError(Exception):
     pass
+
+
+def _finalize_name_version(name, version) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Validate a parsed (name, version) pair and normalize the version to its
+    PEP 440 canonical form. Returns (None, None) when the pair is unusable
+    (missing values, non-string values, or a version that is not valid
+    PEP 440).
+    """
+    if not isinstance(name, str) or not isinstance(version, str):
+        return None, None
+    canonical_version = _canonicalize_version(version)
+    if canonical_version is None:
+        return None, None
+    return name, canonical_version
 
 
 def _parse_pyproject_name_version(contents: str) -> Tuple[Optional[str], Optional[str]]:
@@ -88,13 +111,7 @@ def _parse_pyproject_name_version(contents: str) -> Tuple[Optional[str], Optiona
             # assume shape on third-party input.
             LOG.debug("pyproject.toml [project] is not a table; cannot read name/version")
             return None, None
-        candidate_name, candidate_version = project.get("name"), project.get("version")
-        if isinstance(candidate_name, str) and isinstance(candidate_version, str):
-            canonical_version = _canonicalize_version(candidate_version)
-            if canonical_version is None:
-                return None, None
-            return candidate_name, canonical_version
-        return None, None
+        return _finalize_name_version(project.get("name"), project.get("version"))
     name, version = None, None
     in_project_section = False
     for line in contents.splitlines():
@@ -115,12 +132,7 @@ def _parse_pyproject_name_version(contents: str) -> Tuple[Optional[str], Optiona
             name = value or None
         elif key.strip() == "version" and not version:
             version = value or None
-    if not name or not version:
-        return None, None
-    canonical_version = _canonicalize_version(version)
-    if canonical_version is None:
-        return None, None
-    return name, canonical_version
+    return _finalize_name_version(name, version)
 
 
 class InvalidSourceDistributionNameError(PackagerError):
