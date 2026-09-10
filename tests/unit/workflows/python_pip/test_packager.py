@@ -599,6 +599,13 @@ class TestSDistMetadataFetcher(TestCase):
             # non-scalar values must not be picked up as name/version
             ('[project]\nname = "foo"\ndynamic = ["version"]\n', (None, None)),
             ('[project]\nname = ["foo"]\nversion = "1.0"\n', (None, None)),
+            # the version is normalized to PEP 440 canonical form so it matches
+            # the wheel filename produced by the build backend
+            ('[project]\nname = "foo"\nversion = "2024.01.15"\n', ("foo", "2024.1.15")),
+            ('[project]\nname = "foo"\nversion = "1.0.0-rc1"\n', ("foo", "1.0.0rc1")),
+            ('[project]\nname = "foo"\nversion = "v1.2.3"\n', ("foo", "1.2.3")),
+            # a version that is not valid PEP 440 is unrecoverable
+            ('[project]\nname = "foo"\nversion = "not a version!!"\n', (None, None)),
         ]
     )
     def test_parse_pyproject_name_version(self, contents, expected):
@@ -625,6 +632,12 @@ class TestSDistMetadataFetcher(TestCase):
             self.assertEqual(
                 _parse_pyproject_name_version('[project]\nname = "foo"\nversion = "1.2.3"\nunclosed = ["x"\n'),
                 ("foo", "1.2.3"),
+            )
+
+            # the line-based path also normalizes to PEP 440 canonical form
+            self.assertEqual(
+                _parse_pyproject_name_version('[project]\nname = "foo"\nversion = "2024.01.15"\n'),
+                ("foo", "2024.1.15"),
             )
 
     def test_parse_pyproject_name_version_malformed_toml_returns_none(self):

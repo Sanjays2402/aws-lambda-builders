@@ -17,6 +17,8 @@ except ImportError:  # Python 3.10 does not have tomllib in the standard library
 from aws_lambda_builders.architecture import ARM64, X86_64
 from aws_lambda_builders.utils import extract_tarfile
 
+from packaging.version import InvalidVersion, Version
+
 from .compat import pip_import_string, pip_no_compile_c_env_vars, pip_no_compile_c_shim
 from .utils import OSUtils
 
@@ -27,6 +29,24 @@ LOG = logging.getLogger(__name__)
 #   "1.2.3"            -> group(2) == 1.2.3
 #   'foo'  # comment   -> group(2) == foo
 QUOTED_VALUE = re.compile(r"""^(["'])(.*?)\1\s*(?:#.*)?$""")
+
+
+def _canonicalize_version(version):
+    """
+    Return the PEP 440 canonical form of an author-written version string.
+
+    Every other version producer in this module (PKG-INFO, wheel filenames)
+    supplies the canonical form, and ``Package`` identity comparison is an
+    exact string match -- so a non-canonical ``pyproject.toml`` version would
+    never reconcile with the wheel built from it. Returns None when the
+    version is not valid PEP 440, in which case the package is treated as
+    unrecoverable.
+    """
+    try:
+        return str(Version(version))
+    except InvalidVersion:
+        LOG.debug("pyproject.toml version %r is not a valid PEP 440 version", version)
+        return None
 
 
 # TODO update the wording here
@@ -47,7 +67,10 @@ def _parse_pyproject_name_version(contents: str) -> Tuple[Optional[str], Optiona
     Reads the PEP 621 ``[project]`` name and version from pyproject.toml contents.
 
     Returns (None, None) when no usable static name/version can be determined
-    (missing table, dynamic version, or unparsable file). Uses stdlib
+    (missing table, dynamic version, unparsable file, or a version that is not
+    valid PEP 440). The returned version is normalized to its PEP 440
+    canonical form so it matches the wheel filename produced by the build
+    backend. Uses stdlib
     ``tomllib`` when available (Python 3.11+) and a minimal line-based parse
     of the ``[project]`` section otherwise, so this keeps working on
     Python 3.10. The line-based parse only accepts properly quoted scalars and
@@ -67,7 +90,10 @@ def _parse_pyproject_name_version(contents: str) -> Tuple[Optional[str], Optiona
             return None, None
         candidate_name, candidate_version = project.get("name"), project.get("version")
         if isinstance(candidate_name, str) and isinstance(candidate_version, str):
-            return candidate_name, candidate_version
+            canonical_version = _canonicalize_version(candidate_version)
+            if canonical_version is None:
+                return None, None
+            return candidate_name, canonical_version
         return None, None
     name, version = None, None
     in_project_section = False
@@ -91,7 +117,10 @@ def _parse_pyproject_name_version(contents: str) -> Tuple[Optional[str], Optiona
             version = value or None
     if not name or not version:
         return None, None
-    return name, version
+    canonical_version = _canonicalize_version(version)
+    if canonical_version is None:
+        return None, None
+    return name, canonical_version
 
 
 class InvalidSourceDistributionNameError(PackagerError):
